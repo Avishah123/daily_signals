@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import random
+import concurrent.futures
 
 # Page config
 st.set_page_config(page_title="Active Trades Dashboard", page_icon="📈", layout="wide")
@@ -14,16 +15,9 @@ st.set_page_config(page_title="Active Trades Dashboard", page_icon="📈", layou
 # Database connection using Streamlit secrets
 @st.cache_resource
 def connect_to_db():
-    # Database connection parameters - used as fallback or for hosted apps
-    
     try:
-        # Try to use secrets.toml if available (for local development)
-        try:
-            pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
-        except Exception:
-            # If secrets.toml is not available, use the hardcoded credentials (for hosted apps)
-            pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
-            st.info("Using direct database credentials. For better security, configure secrets in your hosting platform.")
+        # Get database credentials from secrets.toml
+        pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
         
         # Create SQLAlchemy engine
         engine = create_engine(pg_connection_string)
@@ -35,7 +29,22 @@ def connect_to_db():
     except Exception as e:
         st.error(f"Error connecting to database: {e}")
         st.error("""
-If running locally: Place this in .streamlit/secrets.toml
+Please ensure you have correctly set up your database credentials in secrets.toml:
+
+For local development:
+1. Create a .streamlit folder in your project directory
+2. Create a secrets.toml file inside the .streamlit folder
+3. Add your database credentials in this format:
+
+[db]
+host = "your_host"
+port = "your_port"
+database = "your_database"
+user = "your_username"
+password = "your_password"
+
+For hosted environments (like Streamlit Cloud):
+Add these same secrets in your hosting platform's secrets management.
         """)
         return None
 
@@ -60,98 +69,94 @@ def get_table(_engine, table_name):
         st.error(f"Error fetching data from table {table_name}: {e}")
         return pd.DataFrame()
 
-# Function to fetch stock data with retry mechanism
-def fetch_stock_data(symbol, max_retries=3, base_delay=1):
-    """Fetch stock data with exponential backoff retry"""
+# Cache price data for 5 minutes to avoid repeated API calls
+@st.cache_data(ttl=300)
+def get_symbol_price_data(symbol_with_suffix):
+    """Fetch price data for a single symbol with timeout handling"""
+    try:
+        ticker = yf.Ticker(symbol_with_suffix)
+        hist = ticker.history(period="1d")
+        
+        if not hist.empty:
+            return {
+                'current_price': hist['Close'].iloc[-1],
+                'open_price': hist['Open'].iloc[-1]
+            }
+        return None
+    except Exception:
+        return None
+
+# Function to fetch stock data with retry but with a limited timeout
+def fetch_stock_data_with_timeout(symbol, timeout=10):
+    """Fetch stock data with a maximum timeout"""
     clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
     
-    for attempt in range(max_retries):
-        try:
-            # Try with .NS suffix first (for NSE stocks)
-            ticker = yf.Ticker(f"{clean_symbol}.NS")
-            hist = ticker.history(period="1d")
-            
-            if not hist.empty:
-                return {
-                    'current_price': hist['Close'].iloc[-1],
-                    'open_price': hist['Open'].iloc[-1]
-                }
-            
-            # Try with .BO suffix next
-            ticker = yf.Ticker(f"{clean_symbol}.BO")
-            hist = ticker.history(period="1d")
-            
-            if not hist.empty:
-                return {
-                    'current_price': hist['Close'].iloc[-1],
-                    'open_price': hist['Open'].iloc[-1]
-                }
-            
-            # Finally try the raw symbol
-            ticker = yf.Ticker(clean_symbol)
-            hist = ticker.history(period="1d")
-            
-            if not hist.empty:
-                return {
-                    'current_price': hist['Close'].iloc[-1],
-                    'open_price': hist['Open'].iloc[-1]
-                }
-            
-            # If we get here, no data was found for any variant
-            return {
-                'current_price': None,
-                'open_price': None
-            }
-            
-        except Exception as e:
-            # If this is a rate limit error
-            if "Too Many Requests" in str(e) or "Rate limited" in str(e):
-                if attempt < max_retries - 1:  # Don't sleep on the last attempt
-                    # Calculate exponential backoff with jitter
-                    delay = (base_delay * (2 ** attempt)) + (random.random() * base_delay)
-                    time.sleep(delay)
-                    continue
-            
-            # For other errors or if we've exhausted retries
-            return {
-                'current_price': None,
-                'open_price': None
-            }
+    # Try these suffixes in order
+    suffixes = [".NS", ".BO", ""]  # First try NSE, then BSE, then raw
     
-    # If we get here, all retries failed
-    return {
-        'current_price': None,
-        'open_price': None
-    }
+    # Set a start time to track overall timeout
+    start_time = time.time()
+    
+    for suffix in suffixes:
+        # Check if we've exceeded our timeout
+        if time.time() - start_time > timeout:
+            return {'current_price': None, 'open_price': None}
+        
+        symbol_with_suffix = f"{clean_symbol}{suffix}"
+        result = get_symbol_price_data(symbol_with_suffix)
+        
+        if result:
+            return result
+    
+    # If we get here, no data was found for any variant
+    return {'current_price': None, 'open_price': None}
+
+# Process symbols in parallel to speed up data fetching
+def process_symbols_in_parallel(symbols, max_workers=10):
+    """Fetch price data for multiple symbols in parallel"""
+    results = {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks and create a future-to-symbol mapping
+        future_to_symbol = {executor.submit(fetch_stock_data_with_timeout, symbol): symbol for symbol in symbols}
+        
+        # Process completed futures as they complete
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_symbol)):
+            symbol = future_to_symbol[future]
+            try:
+                data = future.result()
+                results[symbol] = data
+            except Exception as e:
+                st.warning(f"Error processing {symbol}: {e}")
+                results[symbol] = {'current_price': None, 'open_price': None}
+            
+            # Update progress (approximately, since these complete out of order)
+            progress = (i + 1) / len(symbols)
+            st.session_state.progress = min(progress, 1.0)
+    
+    return results
 
 # Function to get current prices for symbols using yfinance (not cached)
 def get_current_prices(symbols):
-    """Get current prices for a list of symbols using yfinance with rate limit handling"""
+    """Get current prices for a list of symbols in parallel with progress tracking"""
     if not symbols:
         return {}
     
     try:
-        ticker_data = {}
-        
-        # Use progress bar to show status
+        # Initialize progress tracking
+        st.session_state.progress = 0
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, symbol in enumerate(symbols):
-            progress_percent = int((i / len(symbols)) * 100)
-            progress_bar.progress(progress_percent)
-            status_text.text(f"Fetching data for {symbol}... ({i+1}/{len(symbols)})")
-            
-            # Add a small delay between requests to avoid rate limiting
-            if i > 0:
-                time.sleep(0.2)  # 200ms delay between requests
-            
-            data = fetch_stock_data(symbol)
-            ticker_data[symbol] = data
-            
-            # Clear any previous warning for this symbol
-            # (This doesn't actually work in Streamlit's current implementation, but keeping for future compatibility)
-            # st.warning(f"")
+        # Start progress updating in a separate thread
+        def update_progress_bar():
+            while st.session_state.progress < 1.0:
+                progress_bar.progress(st.session_state.progress)
+                status_text.text(f"Fetching price data... {int(st.session_state.progress * 100)}%")
+                time.sleep(0.1)
+        
+        # Start fetching data
+        ticker_data = process_symbols_in_parallel(symbols)
         
         # Complete the progress bar
         progress_bar.progress(100)
@@ -178,8 +183,15 @@ def update_trade_data_with_prices(df):
     # Combine lists and remove duplicates
     all_symbols = list(set(symbols_needing_entry_price + symbols_needing_exit_price))
     
+    # Show how many symbols we're processing
+    st.info(f"Fetching current prices for {len(all_symbols)} symbols...")
+    
     # Get current prices for all needed symbols
     price_data = get_current_prices(all_symbols)
+    
+    # Count how many prices were successfully fetched
+    successful_fetches = sum(1 for symbol in price_data if price_data[symbol]['current_price'] is not None)
+    st.success(f"Successfully fetched prices for {successful_fetches} out of {len(all_symbols)} symbols")
     
     # Update EntryPrice where missing with Open price
     for idx, row in updated_df.iterrows():
@@ -226,6 +238,13 @@ def update_trade_data_with_prices(df):
 def main():
     st.title("Active Trades Dashboard")
     
+    # Initialize session state for progress tracking
+    if 'progress' not in st.session_state:
+        st.session_state.progress = 0
+    
+    # Add a toggle for live price updates
+    update_prices = st.sidebar.checkbox("Update prices from Yahoo Finance", value=True)
+    
     # Connect to database
     engine = connect_to_db()
     
@@ -242,9 +261,13 @@ def main():
     if active_trades.empty:
         st.info("No active trades found")
     else:
-        # Update with current market prices
-        with st.spinner("Fetching current market prices..."):
-            active_trades = update_trade_data_with_prices(active_trades)
+        # Update with current market prices if enabled
+        if update_prices:
+            with st.spinner("Fetching current market prices..."):
+                active_trades = update_trade_data_with_prices(active_trades)
+            st.success("Price updates completed!")
+        else:
+            st.warning("Live price updates are disabled. Toggle the checkbox in the sidebar to enable.")
         
         # Create filters
         col1, col2, col3 = st.columns(3)
