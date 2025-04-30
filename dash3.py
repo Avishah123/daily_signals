@@ -5,6 +5,8 @@ from sqlalchemy import create_engine
 import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
+import time
+import random
 
 # Page config
 st.set_page_config(page_title="Active Trades Dashboard", page_icon="📈", layout="wide")
@@ -12,9 +14,16 @@ st.set_page_config(page_title="Active Trades Dashboard", page_icon="📈", layou
 # Database connection using Streamlit secrets
 @st.cache_resource
 def connect_to_db():
+    # Database connection parameters - used as fallback or for hosted apps
+    
     try:
-        # Get database credentials from secrets.toml
-        pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
+        # Try to use secrets.toml if available (for local development)
+        try:
+            pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
+        except Exception:
+            # If secrets.toml is not available, use the hardcoded credentials (for hosted apps)
+            pg_connection_string = f"postgresql://{st.secrets['db']['user']}:{st.secrets['db']['password']}@{st.secrets['db']['host']}:{st.secrets['db']['port']}/{st.secrets['db']['database']}"
+            st.info("Using direct database credentials. For better security, configure secrets in your hosting platform.")
         
         # Create SQLAlchemy engine
         engine = create_engine(pg_connection_string)
@@ -25,6 +34,9 @@ def connect_to_db():
         return engine
     except Exception as e:
         st.error(f"Error connecting to database: {e}")
+        st.error("""
+If running locally: Place this in .streamlit/secrets.toml
+        """)
         return None
 
 # Fetch data from database with caching
@@ -48,65 +60,102 @@ def get_table(_engine, table_name):
         st.error(f"Error fetching data from table {table_name}: {e}")
         return pd.DataFrame()
 
+# Function to fetch stock data with retry mechanism
+def fetch_stock_data(symbol, max_retries=3, base_delay=1):
+    """Fetch stock data with exponential backoff retry"""
+    clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
+    
+    for attempt in range(max_retries):
+        try:
+            # Try with .NS suffix first (for NSE stocks)
+            ticker = yf.Ticker(f"{clean_symbol}.NS")
+            hist = ticker.history(period="1d")
+            
+            if not hist.empty:
+                return {
+                    'current_price': hist['Close'].iloc[-1],
+                    'open_price': hist['Open'].iloc[-1]
+                }
+            
+            # Try with .BO suffix next
+            ticker = yf.Ticker(f"{clean_symbol}.BO")
+            hist = ticker.history(period="1d")
+            
+            if not hist.empty:
+                return {
+                    'current_price': hist['Close'].iloc[-1],
+                    'open_price': hist['Open'].iloc[-1]
+                }
+            
+            # Finally try the raw symbol
+            ticker = yf.Ticker(clean_symbol)
+            hist = ticker.history(period="1d")
+            
+            if not hist.empty:
+                return {
+                    'current_price': hist['Close'].iloc[-1],
+                    'open_price': hist['Open'].iloc[-1]
+                }
+            
+            # If we get here, no data was found for any variant
+            return {
+                'current_price': None,
+                'open_price': None
+            }
+            
+        except Exception as e:
+            # If this is a rate limit error
+            if "Too Many Requests" in str(e) or "Rate limited" in str(e):
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    # Calculate exponential backoff with jitter
+                    delay = (base_delay * (2 ** attempt)) + (random.random() * base_delay)
+                    time.sleep(delay)
+                    continue
+            
+            # For other errors or if we've exhausted retries
+            return {
+                'current_price': None,
+                'open_price': None
+            }
+    
+    # If we get here, all retries failed
+    return {
+        'current_price': None,
+        'open_price': None
+    }
+
 # Function to get current prices for symbols using yfinance (not cached)
 def get_current_prices(symbols):
-    """Get current prices for a list of symbols using yfinance"""
+    """Get current prices for a list of symbols using yfinance with rate limit handling"""
     if not symbols:
         return {}
     
     try:
-        # For Indian markets, we'll try with .NS suffix first
         ticker_data = {}
         
-        for symbol in symbols:
-            try:
-                # Remove any existing suffix if present
-                clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
-                
-                # First try with .NS suffix for NSE symbols (most common for Indian stocks)
-                ticker = yf.Ticker(f"{clean_symbol}.NS")
-                hist = ticker.history(period="1d")
-                
-                if not hist.empty:
-                    ticker_data[symbol] = {
-                        'current_price': hist['Close'].iloc[-1],
-                        'open_price': hist['Open'].iloc[-1]
-                    }
-                    # st.info(f"Successfully fetched data for {clean_symbol}.NS")
-                else:
-                    # If no data with .NS, try with .BO suffix for BSE symbols
-                    ticker = yf.Ticker(f"{clean_symbol}.BO")
-                    hist = ticker.history(period="1d")
-                    
-                    if not hist.empty:
-                        ticker_data[symbol] = {
-                            'current_price': hist['Close'].iloc[-1],
-                            'open_price': hist['Open'].iloc[-1]
-                        }
-                        # st.info(f"Successfully fetched data for {clean_symbol}.BO")
-                    else:
-                        # As a last resort, try the symbol as-is
-                        ticker = yf.Ticker(clean_symbol)
-                        hist = ticker.history(period="1d")
-                        
-                        if not hist.empty:
-                            ticker_data[symbol] = {
-                                'current_price': hist['Close'].iloc[-1],
-                                'open_price': hist['Open'].iloc[-1]
-                            }
-                            # st.info(f"Successfully fetched data for {clean_symbol}")
-                        else:
-                            st.warning(f"Could not fetch data for {symbol} - please check the symbol")
-                            ticker_data[symbol] = {
-                                'current_price': None,
-                                'open_price': None
-                            }
-            except Exception as e:
-                st.warning(f"Error fetching data for {symbol}: {e}")
-                ticker_data[symbol] = {
-                    'current_price': None,
-                    'open_price': None
-                }
+        # Use progress bar to show status
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, symbol in enumerate(symbols):
+            progress_percent = int((i / len(symbols)) * 100)
+            progress_bar.progress(progress_percent)
+            status_text.text(f"Fetching data for {symbol}... ({i+1}/{len(symbols)})")
+            
+            # Add a small delay between requests to avoid rate limiting
+            if i > 0:
+                time.sleep(0.2)  # 200ms delay between requests
+            
+            data = fetch_stock_data(symbol)
+            ticker_data[symbol] = data
+            
+            # Clear any previous warning for this symbol
+            # (This doesn't actually work in Streamlit's current implementation, but keeping for future compatibility)
+            # st.warning(f"")
+        
+        # Complete the progress bar
+        progress_bar.progress(100)
+        status_text.empty()
         
         return ticker_data
     except Exception as e:
